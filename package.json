@@ -1,0 +1,24 @@
+{
+  "name": "xrl-router-plugin-workbuddy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "WorkBuddy (CodeBuddy) 通道的 xrl-router 插件：OpenAI Chat Completions 反代",
+  "scripts": {
+    "serve": "tsx src/index.ts",
+    "check-auth": "tsx scripts/check-auth.ts",
+    "refresh-token": "tsx scripts/refresh-token.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.8",
+    "dotenv": "^16.3.1",
+    "hono": "^4.7.4",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.6.2",
+    "typescript": "^5.3.2"
+  }
+}
