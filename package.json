@@ -5,6 +5,7 @@
   "description": "WorkBuddy (CodeBuddy) 通道的 xrl-router 插件：OpenAI Chat Completions 反代",
   "scripts": {
     "serve": "tsx src/index.ts",
+    "login": "tsx scripts/login.ts",
     "check-auth": "tsx scripts/check-auth.ts",
     "refresh-token": "tsx scripts/refresh-token.ts",
     "typecheck": "tsc --noEmit"

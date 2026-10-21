@@ -1,172 +1,93 @@
 /**
- * workbuddy/auth.ts — WorkBuddy 本机登录态读取、解密、刷新与写回。
+ * auth.ts — 自包含凭证管理（不依赖 WorkBuddy App）。
  *
- * 逆向结论（详见 docs/WORKBUDDY_REVERSE.md）：
- * - 登录态文件：%LOCALAPPDATA%/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
- * - accessToken / refreshToken 是 AES-256-GCM「字段级」密文信封：
- *     { $wbEncrypted: 1, envelope: base64(JSON{suite,keyId,nonce,authTag,ciphertext}) }
- *   AAD = "WB-AAD\0" | ver=1 | "WBEV1" | "sym-v1" | suite | keyId | framing(=2) | 0 | 0
- * - 密钥：WorkBuddy 自定义 binding electron_browser_workbuddy_storage.loggerGet()
- *   返回 { atRestSecretKey }，sha256(secret) 即 AES-256 key（keyId 沿用原信封）
- * - 刷新：POST /v2/plugin/auth/token/refresh，头 X-Refresh-Token + X-Auth-Refresh-Source: plugin，
- *   响应 data.{accessToken,refreshToken,expiresIn,refreshExpiresIn,...}
- * - 写回：App 自身对 auth 文件做目录监听（handleExternalChange → restore），因此插件刷新后
- *   原子写回该文件，WorkBuddy 会同步新登录态，避免 refresh token 轮换互踩。
+ * token 获取顺序：
+ *   1) 内存缓存（提前 refreshAheadMs 视为过期）
+ *   2) 本地凭证存储（credentialStore：DPAPI/AES/明文）
+ *   3) 用 refresh token 续期（POST /v2/plugin/auth/token/refresh），并写回存储
+ *   4) 触发网页登录（webLogin：state → 浏览器 → 轮询换票 → 取账号），并写回存储
+ *
+ * 旧版兼容：WORKBUDDY_USE_LEGACY_APP=1 时，在第 2 步之前先尝试读取并解密
+ * WorkBuddy App 的登录态文件（需要本机安装 App + Electron binding 取 at-rest 密钥）。
+ * 默认关闭，因此本插件可在没有 WorkBuddy 的机器上独立运行。
  */
 
-import { spawnSync } from 'node:child_process';
-import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
 import { settings } from './config';
+import { decodeJwtPayload, jwtExpiresAt } from './jwt';
+import * as store from './credentialStore';
+import { requestHandshake, waitForLogin, fetchAccount, openExternal, type IssuedTokens } from './webLogin';
 
 export interface WorkBuddyAuthState {
   accessToken: string;
   refreshToken: string;
   uid: string;
   domain: string;
-  /** access token 过期时间（ms epoch） */
   expiresAt: number;
-  /** refresh token 过期时间（ms epoch，可能未知） */
   refreshExpiresAt?: number;
-  /** auth 文件原始 JSON（用于写回；env 灾备时为 undefined） */
+  /** 旧版兼容：App 登录态原始 JSON（仅 useLegacyApp 命中时有值） */
   raw?: any;
-  source: 'file' | 'env' | 'cache';
+  source: 'file' | 'env' | 'cache' | 'store' | 'web';
 }
 
-const FRAMING_FIELD = 2;
-const MAGIC_FIELD = 'WBEV1';
-const SUITE_AES_256_GCM = 1;
+export { decodeJwtPayload };
 
-function u32(n: number): Buffer {
-  const b = Buffer.allocUnsafe(4);
-  b.writeUInt32BE(n);
-  return b;
+/** 落盘用的精简凭证（不含 raw） */
+interface StoredCredential {
+  accessToken: string;
+  refreshToken: string;
+  uid: string;
+  domain: string;
+  expiresAt: number;
+  refreshExpiresAt?: number;
+  savedAt: number;
 }
 
-function lp(s: string): Buffer {
-  const b = Buffer.from(s, 'utf8');
-  return Buffer.concat([u32(b.length), b]);
-}
-
-function buildAad(keyId: string, suite: number): Buffer {
-  return Buffer.concat([
-    Buffer.from('WB-AAD\0', 'ascii'),
-    Buffer.from([1]),
-    lp(MAGIC_FIELD),
-    lp('sym-v1'),
-    u32(suite),
-    lp(keyId),
-    Buffer.from([FRAMING_FIELD]),
-    Buffer.from([0]),
-    Buffer.from([0]),
-  ]);
-}
-
-let atRestKey: Buffer | null = null;
-
-/** 读取 at-rest 主密钥（缓存）：用 WorkBuddy 自带的 Electron 以 NODE 模式执行 binding */
-function getAtRestKey(): Buffer {
-  if (atRestKey) return atRestKey;
-  const script = "process.stdout.write(process._linkedBinding('electron_browser_workbuddy_storage').loggerGet())";
-  const r = spawnSync(settings.appPath, ['-e', script], {
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
-    encoding: 'utf8',
-    timeout: 30_000,
-    windowsHide: true,
-  });
-  if (r.error) {
-    throw new Error(`读取 at-rest 密钥失败（WorkBuddy 未安装或路径不对）: ${r.error.message}；可用 WORKBUDDY_APP_PATH 指定`);
-  }
-  if (r.status !== 0) {
-    throw new Error(`读取 at-rest 密钥失败: exit=${r.status} ${(r.stderr || '').trim().slice(0, 300)}`);
-  }
-  let payload: any;
-  try {
-    payload = JSON.parse(r.stdout);
-  } catch {
-    throw new Error('读取 at-rest 密钥失败: binding 输出不是 JSON（WorkBuddy 版本可能不兼容）');
-  }
-  const secret = payload?.atRestSecretKey;
-  if (typeof secret !== 'string' || !secret) {
-    throw new Error('读取 at-rest 密钥失败: atRestSecretKey 缺失');
-  }
-  atRestKey = crypto.createHash('sha256').update(secret, 'utf8').digest();
-  return atRestKey;
-}
-
-interface FieldEnvelope {
-  suite: number;
-  keyId: string;
-  nonce: string;
-  authTag: string;
-  ciphertext: string;
-}
-
-function unwrapEnvelope(wrapper: any): FieldEnvelope {
-  if (!wrapper || typeof wrapper !== 'object' || typeof wrapper.envelope !== 'string') {
-    throw new Error('auth 字段不是 $wbEncrypted 信封格式');
-  }
-  return JSON.parse(Buffer.from(wrapper.envelope, 'base64').toString('utf8'));
-}
-
-function openField(key: Buffer, wrapper: any): string {
-  const env = unwrapEnvelope(wrapper);
-  const d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(env.nonce, 'base64'), { authTagLength: 16 });
-  d.setAAD(buildAad(env.keyId, env.suite));
-  d.setAuthTag(Buffer.from(env.authTag, 'base64'));
-  return Buffer.concat([d.update(Buffer.from(env.ciphertext, 'base64')), d.final()]).toString('utf8');
-}
-
-function sealField(key: Buffer, keyId: string, plaintext: string): any {
-  const nonce = crypto.randomBytes(12);
-  const c = crypto.createCipheriv('aes-256-gcm', key, nonce, { authTagLength: 16 });
-  c.setAAD(buildAad(keyId, SUITE_AES_256_GCM));
-  const ciphertext = Buffer.concat([c.update(Buffer.from(plaintext, 'utf8')), c.final()]);
-  const envelope: FieldEnvelope = {
-    suite: SUITE_AES_256_GCM,
-    keyId,
-    nonce: nonce.toString('base64'),
-    authTag: c.getAuthTag().toString('base64'),
-    ciphertext: ciphertext.toString('base64'),
-  };
-  return { $wbEncrypted: 1, envelope: Buffer.from(JSON.stringify(envelope), 'utf8').toString('base64') };
-}
-
-/** 解 JWT payload（不校验签名，只用于取 exp/sub） */
-export function decodeJwtPayload(token: string): any {
-  try {
-    const part = token.split('.')[1] || '';
-    return JSON.parse(Buffer.from(part.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'));
-  } catch {
-    return {};
-  }
-}
-
-function jwtExpiresAt(token: string): number {
-  const exp = Number(decodeJwtPayload(token).exp);
-  return Number.isFinite(exp) && exp > 0 ? exp * 1000 : 0;
-}
-
-function readAuthFile(): WorkBuddyAuthState {
-  const raw = JSON.parse(fs.readFileSync(settings.authPath, 'utf8'));
-  if (!raw?.auth?.accessToken || !raw?.auth?.refreshToken) {
-    throw new Error('登录态文件缺少 auth.accessToken / auth.refreshToken');
-  }
-  const key = getAtRestKey();
-  const accessToken = openField(key, raw.auth.accessToken);
-  const refreshToken = openField(key, raw.auth.refreshToken);
-  if (!accessToken || !refreshToken) throw new Error('登录态 token 解密为空');
+function toStored(s: WorkBuddyAuthState): StoredCredential {
   return {
-    accessToken,
-    refreshToken,
-    uid: raw.account?.uid ?? decodeJwtPayload(accessToken).sub ?? '',
-    domain: raw.auth.domain || settings.domain,
-    expiresAt: Number(raw.auth.expiresAt) || jwtExpiresAt(accessToken),
-    refreshExpiresAt: Number(raw.auth.refreshExpiresAt) || undefined,
-    raw,
-    source: 'file',
+    accessToken: s.accessToken,
+    refreshToken: s.refreshToken,
+    uid: s.uid,
+    domain: s.domain,
+    expiresAt: s.expiresAt,
+    refreshExpiresAt: s.refreshExpiresAt,
+    savedAt: Date.now(),
   };
+}
+
+function storeOpts() {
+  return { file: settings.credentialPath, mode: settings.storeMode, secret: settings.authSecret || undefined };
+}
+
+/** 读本地凭证存储；缺失或损坏返回 null */
+function readStore(): WorkBuddyAuthState | null {
+  try {
+    const blob = store.readBlob(settings.credentialPath);
+    if (!blob) return null;
+    const c = store.open<StoredCredential>(storeOpts(), blob);
+    if (!c || typeof c.accessToken !== 'string' || !c.accessToken) return null;
+    return {
+      accessToken: c.accessToken,
+      refreshToken: c.refreshToken || '',
+      uid: c.uid || decodeJwtPayload(c.accessToken).sub || '',
+      domain: c.domain || settings.domain,
+      expiresAt: Number(c.expiresAt) || jwtExpiresAt(c.accessToken),
+      refreshExpiresAt: c.refreshExpiresAt,
+      source: 'store',
+    };
+  } catch (e: any) {
+    console.warn(`[workbuddy] 读取本地凭证失败: ${e.message}`);
+    return null;
+  }
+}
+
+/** 原子写本地凭证存储（加密形态自动选择） */
+function writeStore(s: WorkBuddyAuthState): void {
+  try {
+    const rec = store.seal(storeOpts(), toStored(s));
+    store.writeBlob(settings.credentialPath, rec.blob);
+  } catch (e: any) {
+    console.warn(`[workbuddy] 写入本地凭证失败: ${e.message}`);
+  }
 }
 
 function loadFromEnv(): WorkBuddyAuthState | null {
@@ -181,17 +102,6 @@ function loadFromEnv(): WorkBuddyAuthState | null {
   };
 }
 
-/** 尝试读取文件；失败返回 null（由上层决定降级） */
-function tryReadAuthFile(): WorkBuddyAuthState | null {
-  try {
-    if (!fs.existsSync(settings.authPath)) return null;
-    return readAuthFile();
-  } catch (e: any) {
-    console.warn(`[workbuddy] 读取登录态失败: ${e.message}`);
-    return null;
-  }
-}
-
 interface RefreshPayload {
   accessToken: string;
   refreshToken?: string;
@@ -199,6 +109,7 @@ interface RefreshPayload {
   refreshExpiresAt?: number;
   expiresIn?: number;
   refreshExpiresIn?: number;
+  domain?: string;
   rawData: any;
 }
 
@@ -207,17 +118,16 @@ function num(v: any): number | undefined {
   return typeof n === 'number' && Number.isFinite(n) ? n : undefined;
 }
 
+/** 用 refresh token 续期（/v2/plugin/auth/token/refresh） */
 async function requestRefreshToken(state: WorkBuddyAuthState): Promise<RefreshPayload> {
-  if (!state.refreshToken) {
-    throw new Error('没有 refresh token（请打开 WorkBuddy 重新登录）');
-  }
+  if (!state.refreshToken) throw new Error('没有 refresh token，需要重新登录');
   const url = `${settings.baseUrl}${settings.refreshPath}`;
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Accept': 'application/json',
     'X-Refresh-Token': state.refreshToken,
     'X-Auth-Refresh-Source': 'plugin',
-    'X-Domain': state.domain,
+    'X-Domain': state.domain || settings.domain,
     'X-Product': settings.product,
     'X-IDE-Type': 'WorkBuddy',
     'X-IDE-Name': 'WorkBuddy',
@@ -228,12 +138,7 @@ async function requestRefreshToken(state: WorkBuddyAuthState): Promise<RefreshPa
   };
   if (state.uid) headers['X-User-Id'] = state.uid;
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: '{}',
-    signal: AbortSignal.timeout(30_000),
-  });
+  const res = await fetch(url, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(30_000) });
   const text = await res.text();
   let json: any;
   try {
@@ -246,99 +151,159 @@ async function requestRefreshToken(state: WorkBuddyAuthState): Promise<RefreshPa
   }
   const data = json.data?.data ?? json.data;
   const accessToken = data?.accessToken ?? data?.access_token;
-  if (typeof accessToken !== 'string' || !accessToken) {
-    throw new Error('刷新令牌响应缺少 accessToken');
-  }
+  if (typeof accessToken !== 'string' || !accessToken) throw new Error('刷新令牌响应缺少 accessToken');
   return {
     accessToken,
-    refreshToken: typeof (data.refreshToken ?? data.refresh_token) === 'string' ? (data.refreshToken ?? data.refresh_token) : undefined,
+    refreshToken:
+      typeof (data.refreshToken ?? data.refresh_token) === 'string' ? (data.refreshToken ?? data.refresh_token) : undefined,
     expiresAt: num(data.expiresAt),
     refreshExpiresAt: num(data.refreshExpiresAt),
     expiresIn: num(data.expiresIn),
     refreshExpiresIn: num(data.refreshExpiresIn),
+    domain: typeof data.domain === 'string' ? data.domain : undefined,
     rawData: data,
   };
 }
 
-/** 把新 token 原子写回 auth 文件（App 会监听并同步） */
-function persistAuthFile(base: WorkBuddyAuthState, p: RefreshPayload): void {
-  if (!base.raw || base.source !== 'file') return;
-  try {
-    const key = getAtRestKey();
-    const raw = JSON.parse(JSON.stringify(base.raw));
-    const keyId = unwrapEnvelope(raw.auth.accessToken).keyId;
-    const now = Date.now();
+function applyRefresh(base: WorkBuddyAuthState, p: RefreshPayload): WorkBuddyAuthState {
+  return {
+    accessToken: p.accessToken,
+    refreshToken: p.refreshToken ?? base.refreshToken,
+    uid: base.uid || decodeJwtPayload(p.accessToken).sub || '',
+    domain: p.domain || base.domain,
+    expiresAt: p.expiresAt ?? (p.expiresIn ? Date.now() + p.expiresIn * 1000 : jwtExpiresAt(p.accessToken)),
+    refreshExpiresAt:
+      p.refreshExpiresAt ?? (p.refreshExpiresIn ? Date.now() + p.refreshExpiresIn * 1000 : base.refreshExpiresAt),
+    raw: base.raw,
+    source: base.source === 'cache' ? 'store' : base.source,
+  };
+}
 
-    raw.auth.accessToken = sealField(key, keyId, p.accessToken);
-    if (p.refreshToken) raw.auth.refreshToken = sealField(key, keyId, p.refreshToken);
-
-    const expiresAt = p.expiresAt ?? (p.expiresIn ? now + p.expiresIn * 1000 : undefined);
-    const refreshExpiresAt = p.refreshExpiresAt ?? (p.refreshExpiresIn ? now + p.refreshExpiresIn * 1000 : undefined);
-    if (p.expiresIn !== undefined) raw.auth.expiresIn = p.expiresIn;
-    if (p.refreshExpiresIn !== undefined) raw.auth.refreshExpiresIn = p.refreshExpiresIn;
-    if (expiresAt !== undefined) raw.auth.expiresAt = expiresAt;
-    if (refreshExpiresAt !== undefined) raw.auth.refreshExpiresAt = refreshExpiresAt;
-    raw.auth.lastRefreshTime = now;
-    for (const k of ['tokenType', 'sessionState', 'scope', 'notBeforePolicy', 'domain']) {
-      if (p.rawData?.[k] !== undefined) raw.auth[k] = p.rawData[k];
-    }
-
-    const tmp = `${settings.authPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(raw, null, 2), { mode: 0o600 });
-    fs.renameSync(tmp, settings.authPath);
-    suppressWatchUntil = Date.now() + 2000;
-    lastMtime = fs.statSync(settings.authPath).mtimeMs;
-    console.log('[workbuddy] 新 token 已写回登录态文件（WorkBuddy App 将同步）');
-  } catch (e: any) {
-    console.warn(`[workbuddy] token 写回失败（不影响转发）: ${e.message}`);
-  }
+function tokensToState(t: IssuedTokens, uid: string, domain: string): WorkBuddyAuthState {
+  return {
+    accessToken: t.accessToken,
+    refreshToken: t.refreshToken,
+    uid: uid || decodeJwtPayload(t.accessToken).sub || '',
+    domain: domain || t.domain || settings.domain,
+    expiresAt: t.expiresAt,
+    refreshExpiresAt: t.refreshExpiresAt,
+    source: 'web',
+  };
 }
 
 let cached: WorkBuddyAuthState | null = null;
 let refreshing: Promise<WorkBuddyAuthState> | null = null;
-let watcher: fs.FSWatcher | null = null;
-let watchDebounce: NodeJS.Timeout | null = null;
-let lastMtime = 0;
-let suppressWatchUntil = 0;
 
-function startAuthWatch(): void {
-  if (watcher) return;
-  const dir = path.dirname(settings.authPath);
-  const base = path.basename(settings.authPath);
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    lastMtime = fs.existsSync(settings.authPath) ? fs.statSync(settings.authPath).mtimeMs : 0;
-    watcher = fs.watch(dir, (_event, filename) => {
-      if (filename !== base) return;
-      if (watchDebounce) clearTimeout(watchDebounce);
-      watchDebounce = setTimeout(() => {
-        watchDebounce = null;
-        if (Date.now() < suppressWatchUntil) return;
-        try {
-          const mtime = fs.statSync(settings.authPath).mtimeMs;
-          if (mtime === lastMtime) return;
-          lastMtime = mtime;
-          const fresh = readAuthFile();
-          cached = fresh;
-          console.log(`[workbuddy] 已同步 App 刷新后的登录态（有效期至 ${new Date(fresh.expiresAt).toISOString()}）`);
-        } catch (e: any) {
-          console.warn(`[workbuddy] 登录态文件变更后读取失败: ${e.message}`);
-        }
-      }, 800);
-    });
-    watcher.on('error', (err) => {
-      console.warn(`[workbuddy] 登录态文件监听异常: ${err.message}，5s 后重试`);
-      watcher = null;
-      setTimeout(startAuthWatch, 5000);
-    });
-    console.log(`[workbuddy] 已监听登录态文件（${settings.authPath}）`);
-  } catch (e: any) {
-    console.warn(`[workbuddy] 启动登录态监听失败: ${e.message}`);
-  }
+/** 旧版兼容钩子：useLegacyApp 开启时读取并解密 App 登录态（在 legacy.ts 实现） */
+let legacyReader: (() => WorkBuddyAuthState | null) | null = null;
+export function registerLegacyReader(fn: () => WorkBuddyAuthState | null): void {
+  legacyReader = fn;
 }
 
-export function initTokenManager(): void {
-  startAuthWatch();
+/** 交互式网页登录：握手 → 打开浏览器 → 轮询换票 → 取账号 → 落盘 */
+export async function interactiveLogin(opts: { openBrowser?: (url: string) => void; signal?: AbortSignal } = {}): Promise<WorkBuddyAuthState> {
+  const hs = await requestHandshake(opts.signal);
+  console.log('\n=== WorkBuddy 网页登录 ===');
+  console.log(`请在浏览器完成登录（扫码或账号密码，${Math.round(settings.loginTimeoutMs / 60000)} 分钟内有效）：\n  ${hs.authUrl}\n`);
+  const opener = opts.openBrowser ?? openExternal;
+  opener(hs.authUrl);
+  console.log('等待登录完成…');
+
+  const tokens = await waitForLogin(hs, { signal: opts.signal });
+  const acct = await fetchAccount(tokens.accessToken, tokens.domain || settings.domain);
+  const state = tokensToState(tokens, acct?.uid || '', acct?.domain || tokens.domain || settings.domain);
+  writeStore(state);
+  cached = state;
+  console.log(`登录成功：uid=${state.uid || '<空>'} 账号=${acct?.nickname || acct?.type || '未知'} 有效期至 ${new Date(state.expiresAt).toISOString()}`);
+  console.log(`凭证已加密保存到 ${settings.credentialPath}（存储形态 ${store.describeKind(store.readBlob(settings.credentialPath))}）`);
+  return state;
+}
+
+/**
+ * 获取有效 token：缓存 → 本地存储 →（旧版 App）→ 刷新 → 网页登录。
+ */
+export async function getToken(): Promise<WorkBuddyAuthState> {
+  if (cached && Date.now() < cached.expiresAt - settings.refreshAheadMs) return cached;
+  if (refreshing) return refreshing;
+
+  refreshing = (async () => {
+    // 1) 本地存储
+    const fromStore = readStore();
+    if (fromStore) {
+      cached = fromStore;
+      if (Date.now() < fromStore.expiresAt - settings.refreshAheadMs) return fromStore;
+    }
+
+    // 2) 旧版兼容（可选）：读取并解密 App 登录态
+    if (settings.useLegacyApp && legacyReader) {
+      const legacy = legacyReader();
+      if (legacy) {
+        writeStore(legacy);
+        cached = legacy;
+        if (Date.now() < legacy.expiresAt - settings.refreshAheadMs) return legacy;
+      }
+    }
+
+    // 3) 有 refresh token 就续期
+    const base = cached ?? fromStore ?? loadFromEnv();
+    if (base?.refreshToken) {
+      try {
+        const p = await requestRefreshToken(base);
+        const next = applyRefresh(base, p);
+        writeStore(next);
+        cached = next;
+        console.log(`[workbuddy] token 已刷新（有效期至 ${new Date(next.expiresAt).toISOString()}）`);
+        return next;
+      } catch (e: any) {
+        console.warn(`[workbuddy] 续期失败，转网页登录: ${e.message}`);
+      }
+    }
+
+    // 4) 网页登录（仅在允许自动登录时；否则抛错，引导用 pnpm login）
+    if (!settings.autoLogin) {
+      throw new Error(
+        '无有效登录态。请先运行 `pnpm login` 完成网页登录，' +
+          '或在 .env 设置 WORKBUDDY_AUTO_LOGIN=1 允许服务自动发起登录。',
+      );
+    }
+    return interactiveLogin();
+  })().finally(() => {
+    refreshing = null;
+  });
+
+  return refreshing;
+}
+
+/** 强制刷新（上游 401 时重试一次）；刷新不成则落回网页登录（仅 autoLogin 开启时） */
+export async function forceRefresh(): Promise<WorkBuddyAuthState> {
+  if (refreshing) return refreshing;
+  const base = readStore() ?? cached ?? loadFromEnv();
+  if (!base?.refreshToken) {
+    cached = null;
+    if (!settings.autoLogin) throw new Error('无 refresh token，无法刷新；请运行 `pnpm login` 重新登录');
+    return interactiveLogin();
+  }
+  refreshing = (async () => {
+    try {
+      const p = await requestRefreshToken(base);
+      const next = applyRefresh(base, p);
+      writeStore(next);
+      cached = next;
+      console.log(`[workbuddy] token 已强制刷新（有效期至 ${new Date(next.expiresAt).toISOString()}）`);
+      return next;
+    } catch (e: any) {
+      cached = null;
+      if (!settings.autoLogin) {
+        console.warn(`[workbuddy] 强制刷新失败（登录态可能已失效）: ${e.message}`);
+        throw new Error('refresh token 续期失败，请运行 `pnpm login` 重新登录');
+      }
+      console.warn(`[workbuddy] 强制刷新失败，转网页登录: ${e.message}`);
+      return interactiveLogin();
+    }
+  })().finally(() => {
+    refreshing = null;
+  });
+  return refreshing;
 }
 
 export function getCachedAuth(): WorkBuddyAuthState | null {
@@ -353,8 +318,17 @@ export function getAuthStatus(): {
   expiresAt?: string;
   refreshExpiresAt?: string;
   hasRefreshToken?: boolean;
+  credentialPath: string;
+  storeKind: string;
+  legacyApp: boolean;
 } {
-  if (!cached) return { loggedIn: false };
+  const kind = store.describeKind(store.readBlob(settings.credentialPath));
+  const base = {
+    credentialPath: settings.credentialPath,
+    storeKind: kind,
+    legacyApp: settings.useLegacyApp,
+  };
+  if (!cached) return { loggedIn: false, ...base };
   return {
     loggedIn: Date.now() < cached.expiresAt,
     uid: cached.uid,
@@ -363,83 +337,13 @@ export function getAuthStatus(): {
     expiresAt: new Date(cached.expiresAt).toISOString(),
     refreshExpiresAt: cached.refreshExpiresAt ? new Date(cached.refreshExpiresAt).toISOString() : undefined,
     hasRefreshToken: Boolean(cached.refreshToken),
+    ...base,
   };
 }
 
-/**
- * 获取有效 token：
- * 1) 内存缓存（提前 5min 视为过期）
- * 2) 重读 auth 文件（App 可能刚刷新过）
- * 3) 用 refresh token 换新（并写回文件）
- * 4) .env 灾备凭证
- */
-export async function getToken(): Promise<WorkBuddyAuthState> {
-  if (cached && Date.now() < cached.expiresAt - settings.refreshAheadMs) return cached;
-  if (refreshing) return refreshing;
-
-  refreshing = (async () => {
-    const fromFile = tryReadAuthFile();
-    if (fromFile) {
-      cached = fromFile;
-      if (Date.now() < fromFile.expiresAt - settings.refreshAheadMs) return fromFile;
-    }
-
-    const base = cached ?? fromFile ?? loadFromEnv();
-    if (!base) {
-      throw new Error('无可用登录态：请打开 WorkBuddy 登录，或在 .env 配置 WORKBUDDY_ACCESS_TOKEN');
-    }
-
-    const p = await requestRefreshToken(base);
-    const next: WorkBuddyAuthState = {
-      accessToken: p.accessToken,
-      refreshToken: p.refreshToken ?? base.refreshToken,
-      uid: base.uid || decodeJwtPayload(p.accessToken).sub || '',
-      domain: (p.rawData?.domain as string) || base.domain,
-      expiresAt: p.expiresAt ?? (p.expiresIn ? Date.now() + p.expiresIn * 1000 : jwtExpiresAt(p.accessToken)),
-      refreshExpiresAt:
-        p.refreshExpiresAt ??
-        (p.refreshExpiresIn ? Date.now() + p.refreshExpiresIn * 1000 : base.refreshExpiresAt),
-      raw: base.raw,
-      source: base.source,
-    };
-    persistAuthFile(base, p);
-    cached = next;
-    console.log(`[workbuddy] token 已刷新（有效期至 ${new Date(next.expiresAt).toISOString()}）`);
-    return next;
-  })().finally(() => {
-    refreshing = null;
-  });
-
-  return refreshing;
-}
-
-/** 强制刷新（上游 401 时重试一次） */
-export async function forceRefresh(): Promise<WorkBuddyAuthState> {
-  if (refreshing) return refreshing;
-  const base = tryReadAuthFile() ?? cached ?? loadFromEnv();
-  if (!base) throw new Error('无可用登录态，无法刷新');
-  refreshing = (async () => {
-    const p = await requestRefreshToken(base);
-    const next: WorkBuddyAuthState = {
-      accessToken: p.accessToken,
-      refreshToken: p.refreshToken ?? base.refreshToken,
-      uid: base.uid || decodeJwtPayload(p.accessToken).sub || '',
-      domain: (p.rawData?.domain as string) || base.domain,
-      expiresAt: p.expiresAt ?? (p.expiresIn ? Date.now() + p.expiresIn * 1000 : jwtExpiresAt(p.accessToken)),
-      refreshExpiresAt:
-        p.refreshExpiresAt ??
-        (p.refreshExpiresIn ? Date.now() + p.refreshExpiresIn * 1000 : base.refreshExpiresAt),
-      raw: base.raw,
-      source: base.source,
-    };
-    persistAuthFile(base, p);
-    cached = next;
-    console.log(`[workbuddy] token 已强制刷新（有效期至 ${new Date(next.expiresAt).toISOString()}）`);
-    return next;
-  })().finally(() => {
-    refreshing = null;
-  });
-  return refreshing;
+/** 启动期无阻塞探测：填充缓存但不触发登录，返回状态 */
+export function initTokenManager(): void {
+  cached = readStore() ?? (settings.useLegacyApp && legacyReader ? legacyReader() : null);
 }
 
 /** 采纳外部凭据（诊断脚本用） */
