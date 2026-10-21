@@ -27,7 +27,7 @@ export function detectAuthPath(): string {
 /** WorkBuddy 可执行文件（旧版兼容：读取 at-rest 密钥解密 App 登录态） */
 export function detectAppPath(): string {
   if (process.platform === 'win32') {
-    return 'C:\Program Files\WorkBuddy\WorkBuddy.exe';
+    return 'C:/Program Files/WorkBuddy/WorkBuddy.exe';
   }
   return '/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy';
 }

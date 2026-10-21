@@ -2,7 +2,8 @@
  * 诊断：检查自包含凭证存储与网关连通性（不打印任何 token）。
  * 用法：pnpm check-auth
  *
- * 只读探测，绝不触发网页登录。
+ * 默认（WORKBUDDY_AUTO_LOGIN=0）不弹浏览器：未登录时只提示 pnpm login。
+ * 注意：若开启 autoLogin 且本地 token 已落在提前刷新窗口内，getToken 仍可能触发网页登录。
  */
 
 import { initTokenManager, getAuthStatus, getToken } from '../src/auth';
