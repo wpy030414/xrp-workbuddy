@@ -2,6 +2,10 @@
 
 本文记录本插件依赖的 WorkBuddy（CodeBuddy）客户端行为与网关协议。仅用于本机、本人账号的互操作实验。
 
+> 凭证来源有两条路径：
+> - **默认：自包含网页登录**（见第 9 节）——不依赖 WorkBuddy App，本机没装 App 也能独立运行。
+> - 可选：旧版 App 兼容（第 3 节，`WORKBUDDY_USE_LEGACY_APP=1` 时启用）——读取并解密 App 登录态文件。
+
 ## 1. 网关端点
 
 | 用途 | 方法与路径 | 说明 |
@@ -272,3 +276,54 @@ pnpm serve
 - 不记录、不打印 token / refresh token / at-rest secret 明文
 - `.env` 不进入版本控制
 - 刷新会轮换 refresh token 并写回 WorkBuddy 登录态文件，操作前应确认影响
+
+## 9. 自包含网页登录（脱离 App，已实测）
+
+WorkBuddy 桌面 / CLI 客户端内部就用这套「state 握手 → 浏览器登录 → 轮询换票」的
+device 式流程登录（逆向自 `app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs` 的
+`AccountScopedExternalLinkAuthenticationProvider` / `ExternalLinkAuthenticationProvider`）。
+本插件直接复用同样的端点，因此**不需要安装 WorkBuddy App，也不需要解密 App 登录态文件**。
+
+端点（`prefixPath = /plugin`，platform 走 `workbuddy`）：
+
+| 步骤 | 方法与路径 | 说明 |
+|---|---|---|
+| 申请 state | `POST /v2/plugin/auth/state?platform=workbuddy` | 返回 `{data:{state, authUrl}}` |
+| 浏览器登录 | `authUrl` = `https://www.workbuddy.cn/login?platform=workbuddy&state=<state>` | 用户在腾讯托管页扫码/账密，插件不经手口令 |
+| 轮询换票 | `GET /v2/plugin/auth/token?state=<state>` | 未登录：HTTP 200 且 `code:11217`（pending）；成功：`code:0` + token |
+| 取账号 | `GET /v2/plugin/account`（`Authorization: Bearer <accessToken>`） | 返回 `uid` / `nickname` 等 |
+
+换票响应（成功）字段：`accessToken` / `refreshToken` / `expiresIn` / `refreshExpiresIn`
+（也兼容 `expiresAt` / `access_token` / `refresh_token`）。
+
+握手期必须带「未登录」标记头（缺了会被网关按已登录校验）：
+
+```
+X-No-Authorization: true
+X-No-User-Id: true
+X-No-Enterprise-Id: true
+X-No-Department-Info: true
+X-Domain: www.workbuddy.cn
+X-Product: SaaS
+X-IDE-Type / X-IDE-Name: WorkBuddy
+User-Agent: WorkBuddy/<ver>
+```
+
+### 9.1 关键实测结论
+
+1. **两域共用同一 state 存储**：`copilot.tencent.com` 与 `www.workbuddy.cn` 上申请的
+   state 可互相换票。用 `www.workbuddy.cn` 登录换到的 access token，能直接在
+   `copilot.tencent.com` 拉到 33 条模型目录，验证跨域 token 有效。
+2. **pending 语义**：登录完成前轮询返回 HTTP **200** + `{"code":11217}`，不是 4xx；
+   客户端必须按 `code` 判断，不能只看 HTTP status。
+3. **access token 为 JWT**：payload 的 `sub` 即 `uid`，`exp` 可兜底算过期；`scope` 含
+   `offline_access`，refresh 走标准 `/v2/plugin/auth/token/refresh`（与第 3.6 节同源）。
+
+### 9.2 与旧版 App 兼容路径的关系
+
+- 默认登录态来源就是本节网页登录，凭证经 DPAPI/AES 加密存到
+  `credentialPath`（默认用户数据目录，不进 git）。
+- `WORKBUDDY_USE_LEGACY_APP=1` 时才加载 `src/legacy.ts`，读取并解密 App 的
+  `workbuddy-desktop.info`（第 3 节）。两条路径互不干扰；开启旧版兼容且解出 token 时，
+  会迁移写入自包含存储，后续按自包含流程刷新。
+- 本插件**不再**默认监听 / 写回 App 登录态文件；刷新只作用于本地凭证存储。

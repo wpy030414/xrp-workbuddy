@@ -39,7 +39,7 @@ function detectCredentialPath(): string {
     (process.platform === 'win32'
       ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
       : path.join(os.homedir(), '.local', 'share'));
-  return path.join(base, 'xrl-router-plugin-workbuddy', 'workbuddy-credential.json');
+  return path.join(base.replace(/\/+$/, ''), 'xrl-router-plugin-workbuddy', 'workbuddy-credential.json');
 }
 
 export interface Settings {
