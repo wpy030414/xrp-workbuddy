@@ -1,8 +1,8 @@
 {
-  "name": "xrl-router-plugin-workbuddy",
+  "name": "xrp-workbuddy",
   "version": "0.1.0",
   "private": true,
-  "description": "WorkBuddy (CodeBuddy) 通道的 xrl-router 插件：OpenAI Chat Completions 反代",
+  "description": "WorkBuddy (CodeBuddy) 通道的 xrl-router 插件：自包含网页登录 + OpenAI Chat Completions 反代",
   "scripts": {
     "serve": "tsx src/index.ts",
     "login": "tsx scripts/login.ts",

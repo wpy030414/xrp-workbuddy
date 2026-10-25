@@ -2,9 +2,8 @@
 
 本文记录本插件依赖的 WorkBuddy（CodeBuddy）客户端行为与网关协议。仅用于本机、本人账号的互操作实验。
 
-> 凭证来源有两条路径：
-> - **默认：自包含网页登录**（见第 9 节）——不依赖 WorkBuddy App，本机没装 App 也能独立运行。
-> - 可选：旧版 App 兼容（第 3 节，`WORKBUDDY_USE_LEGACY_APP=1` 时启用）——读取并解密 App 登录态文件。
+> 凭证来源：**仅支持自包含网页登录**（见第 9 节）——不依赖 WorkBuddy App，本机没装 App 也能独立运行。
+> 第 3 节保留旧版 App 登录态解密的逆向存档，仅作历史资料；对应代码路径已移除。
 
 ## 1. 网关端点
 
@@ -56,7 +55,9 @@ acp-connection-id
 traceparent
 ```
 
-## 3. 登录态文件
+## 3. 旧版 App 登录态（逆向存档，已不再支持）
+
+> 本节仅保留历史逆向资料。插件已移除旧版 App 兼容层，登录只走第 9 节的自包含网页登录。
 
 ### 3.1 位置与结构
 
@@ -160,9 +161,9 @@ X-Domain: www.workbuddy.cn
 - `expiresAt` / `expiresIn`
 - `refreshExpiresAt` / `refreshExpiresIn`
 
-刷新后 refresh token 会轮换。插件将新 token 重新封装（保留 keyId）并原子写回登录态文件（临时文件 + rename）。
+刷新后 refresh token 会轮换。旧版插件曾将新 token 重新封装（保留 keyId）并原子写回登录态文件（临时文件 + rename）；该写回路径已随兼容层一并移除。
 
-WorkBuddy App 对 auth 目录做了监听（`handleExternalChange → restore`），因此写回后 App 会自动拾取新登录态，避免双方刷新互踩。
+当时写回后 WorkBuddy App 会自动拾取新登录态（`handleExternalChange → restore`），以避免双方刷新互踩。
 
 ## 4. 模型目录
 
@@ -275,7 +276,7 @@ pnpm serve
 - 仅使用当前机器、当前登录用户自己的凭证
 - 不记录、不打印 token / refresh token / at-rest secret 明文
 - `.env` 不进入版本控制
-- 刷新会轮换 refresh token 并写回 WorkBuddy 登录态文件，操作前应确认影响
+- 刷新会轮换 refresh token 并写回本地加密凭证存储，操作前应确认影响
 
 ## 9. 自包含网页登录（脱离 App，已实测）
 
@@ -319,11 +320,10 @@ User-Agent: WorkBuddy/<ver>
 3. **access token 为 JWT**：payload 的 `sub` 即 `uid`，`exp` 可兜底算过期；`scope` 含
    `offline_access`，refresh 走标准 `/v2/plugin/auth/token/refresh`（与第 3.6 节同源）。
 
-### 9.2 与旧版 App 兼容路径的关系
+### 9.2 与旧版 App 路径的关系（已移除）
 
-- 默认登录态来源就是本节网页登录，凭证经 DPAPI/AES 加密存到
+- 登录态的唯一来源就是本节网页登录，凭证经 DPAPI/AES 加密存到
   `credentialPath`（默认用户数据目录，不进 git）。
-- `WORKBUDDY_USE_LEGACY_APP=1` 时才加载 `src/legacy.ts`，读取并解密 App 的
-  `workbuddy-desktop.info`（第 3 节）。两条路径互不干扰；开启旧版兼容且解出 token 时，
-  会迁移写入自包含存储，后续按自包含流程刷新。
-- 本插件**不再**默认监听 / 写回 App 登录态文件；刷新只作用于本地凭证存储。
+- 旧版 `src/legacy.ts` 兼容层（读取并解密 App 的 `workbuddy-desktop.info`）
+  已随项目升级为 xrp-workbuddy 一并移除；第 3 节仅作为逆向存档保留。
+- 插件不监听、不写回 App 登录态文件；刷新只作用于本地凭证存储。

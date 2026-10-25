@@ -1,4 +1,4 @@
-# AGENTS.md — xrl-router-plugin-workbuddy
+# AGENTS.md — xrp-workbuddy
 
 本文件为 AI Agent 划定项目边界。在本仓库工作时必须遵守以下约束。
 
@@ -6,7 +6,7 @@
 
 - 本项目是 **WorkBuddy / CodeBuddy 通道的 xrl-router 插件**：把 WorkBuddy 官方网关包装成 OpenAI Chat Completions 兼容的本地服务
 - 上游：`https://copilot.tencent.com`（登录网关 `https://www.workbuddy.cn`，二者共用同一 state 存储）
-- 凭证：自包含网页登录（state 握手 → 浏览器 → 轮询换票），DPAPI/AES 加密落盘；**默认不依赖 WorkBuddy App**
+- 凭证：**仅支持自包含网页登录**（state 握手 → 浏览器 → 轮询换票），DPAPI/AES 加密落盘；不依赖 WorkBuddy App
 - 协议边界：只桥接 OpenAI Chat Completions（`/v1/chat/completions`）；Anthropic Messages 客户端由 xrl-router 转换后调用本插件
 
 ## 边界与范围
@@ -18,6 +18,7 @@
   - **不做本地模型推理** — 纯远端转发
   - **不暴露 `/v1/models` HTTP 端点** — 模型通过 WebSocket 注册推送
   - **不实现 `/v1/embeddings`、`/v1/completions` 等端点**
+  - **不兼容旧版 WorkBuddy App 登录态** — 仅走自包含网页登录
   - **不复用/抓取他人凭证** — 只使用当前机器登录用户自己的账号
 
 ## Agent 操作指南
@@ -30,7 +31,6 @@
 - `.env` 永不进 git（`git check-ignore .env` 必须通过）；自包含凭证文件同样不进 git
 - 日志与脚本禁止输出 token / refresh token / at-rest secret 明文
 - 凭证静态加密：Windows 默认 DPAPI（绑本机本用户），设 `WORKBUDDY_AUTH_SECRET` 则用 AES；明文不进命令行
-- 仅当 `WORKBUDDY_USE_LEGACY_APP=1` 时才走旧版 App 解密；写回 App 登录态文件时必须复用原始信封 `keyId`（不可由密钥推导）
 
 ### V24 契约（不可破坏）
 
@@ -87,7 +87,7 @@ pnpm typecheck
 
 ## 目录速查
 
-- `src/index.ts` — Hono 入口：路由、端口释放、启动（按需接入 legacy 兼容层）
+- `src/index.ts` — Hono 入口：路由、端口释放、启动
 - `src/config.ts` — Settings 单例，集中读取环境变量
 - `src/pluginClient.ts` — WebSocket 注册 / 心跳 / 重连（V24 无 keys）
 - `src/client.ts` — 网关转发、模型目录、SSE 解析与归一化、非流式聚合
@@ -95,7 +95,6 @@ pnpm typecheck
 - `src/webLogin.ts` — 自包含网页登录：state 握手 → 浏览器 → 轮询换票 → 取账号
 - `src/credentialStore.ts` — 凭证静态加密落盘（DPAPI / AES / 明文三形态）
 - `src/jwt.ts` — JWT payload 解码（取 exp/sub）
-- `src/legacy.ts` — 旧版 App 登录态解密/写回（仅 `WORKBUDDY_USE_LEGACY_APP=1` 时加载）
 - `scripts/login.ts` — 交互式网页登录入口
 - `scripts/check-auth.ts` — 登录态与网关诊断
 - `scripts/refresh-token.ts` — 强制续期（需 `--yes`）

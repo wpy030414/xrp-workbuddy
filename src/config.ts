@@ -15,23 +15,6 @@ function envBool(key: string, fallback: boolean): boolean {
   return /^(1|true|yes|on)$/i.test(v.trim());
 }
 
-/** WorkBuddy 登录态文件（旧版兼容路径，仅在 WORKBUDDY_USE_LEGACY_APP=1 时读取） */
-export function detectAuthPath(): string {
-  if (process.platform === 'win32') {
-    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
-    return path.join(localAppData, 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info');
-  }
-  return path.join(os.homedir(), 'Library', 'Application Support', 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info');
-}
-
-/** WorkBuddy 可执行文件（旧版兼容：读取 at-rest 密钥解密 App 登录态） */
-export function detectAppPath(): string {
-  if (process.platform === 'win32') {
-    return 'C:/Program Files/WorkBuddy/WorkBuddy.exe';
-  }
-  return '/Applications/WorkBuddy.app/Contents/MacOS/WorkBuddy';
-}
-
 /** 自包含凭证文件默认落在用户数据目录，不进仓库 */
 function detectCredentialPath(): string {
   const base =
@@ -39,7 +22,7 @@ function detectCredentialPath(): string {
     (process.platform === 'win32'
       ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
       : path.join(os.homedir(), '.local', 'share'));
-  return path.join(base.replace(/\/+$/, ''), 'xrl-router-plugin-workbuddy', 'workbuddy-credential.json');
+  return path.join(base.replace(/\/+$/, ''), 'xrp-workbuddy', 'workbuddy-credential.json');
 }
 
 export interface Settings {
@@ -72,11 +55,6 @@ export interface Settings {
   storeMode: 'auto' | 'dpapi' | 'aes' | 'plain';
   /** AES 模式 passphrase；为空则 Windows 用 DPAPI、其它平台明文 */
   authSecret: string;
-
-  // —— 旧版兼容（依赖 WorkBuddy App；默认关闭）——
-  useLegacyApp: boolean;
-  authPath: string;
-  appPath: string;
 
   refreshAheadMs: number;
   requestTimeoutMs: number;
@@ -119,9 +97,6 @@ export const settings: Settings = {
   storeMode: (env('WORKBUDDY_STORE_MODE', 'auto') as Settings['storeMode']),
   authSecret: env('WORKBUDDY_AUTH_SECRET', ''),
 
-  useLegacyApp: envBool('WORKBUDDY_USE_LEGACY_APP', false),
-  authPath: env('WORKBUDDY_AUTH_PATH', detectAuthPath()),
-  appPath: env('WORKBUDDY_APP_PATH', detectAppPath()),
   refreshAheadMs: parseInt(env('WORKBUDDY_REFRESH_AHEAD_MS', String(5 * 60_000)), 10),
   requestTimeoutMs: parseInt(env('WORKBUDDY_REQUEST_TIMEOUT_MS', '600000'), 10),
 

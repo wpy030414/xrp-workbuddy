@@ -6,10 +6,6 @@
  *   2) 本地凭证存储（credentialStore：DPAPI/AES/明文）
  *   3) 用 refresh token 续期（POST /v2/plugin/auth/token/refresh），并写回存储
  *   4) 触发网页登录（webLogin：state → 浏览器 → 轮询换票 → 取账号），并写回存储
- *
- * 旧版兼容：WORKBUDDY_USE_LEGACY_APP=1 时，在第 2 步之前先尝试读取并解密
- * WorkBuddy App 的登录态文件（需要本机安装 App + Electron binding 取 at-rest 密钥）。
- * 默认关闭，因此本插件可在没有 WorkBuddy 的机器上独立运行。
  */
 
 import { settings } from './config';
@@ -24,9 +20,7 @@ export interface WorkBuddyAuthState {
   domain: string;
   expiresAt: number;
   refreshExpiresAt?: number;
-  /** 旧版兼容：App 登录态原始 JSON（仅 useLegacyApp 命中时有值） */
-  raw?: any;
-  source: 'file' | 'env' | 'cache' | 'store' | 'web';
+  source: 'env' | 'cache' | 'store' | 'web';
 }
 
 export { decodeJwtPayload };
@@ -174,7 +168,6 @@ function applyRefresh(base: WorkBuddyAuthState, p: RefreshPayload): WorkBuddyAut
     expiresAt: p.expiresAt ?? (p.expiresIn ? Date.now() + p.expiresIn * 1000 : jwtExpiresAt(p.accessToken)),
     refreshExpiresAt:
       p.refreshExpiresAt ?? (p.refreshExpiresIn ? Date.now() + p.refreshExpiresIn * 1000 : base.refreshExpiresAt),
-    raw: base.raw,
     source: base.source === 'cache' ? 'store' : base.source,
   };
 }
@@ -193,12 +186,6 @@ function tokensToState(t: IssuedTokens, uid: string, domain: string): WorkBuddyA
 
 let cached: WorkBuddyAuthState | null = null;
 let refreshing: Promise<WorkBuddyAuthState> | null = null;
-
-/** 旧版兼容钩子：useLegacyApp 开启时读取并解密 App 登录态（在 legacy.ts 实现） */
-let legacyReader: (() => WorkBuddyAuthState | null) | null = null;
-export function registerLegacyReader(fn: () => WorkBuddyAuthState | null): void {
-  legacyReader = fn;
-}
 
 /** 交互式网页登录：握手 → 打开浏览器 → 轮询换票 → 取账号 → 落盘 */
 export async function interactiveLogin(opts: { openBrowser?: (url: string) => void; signal?: AbortSignal } = {}): Promise<WorkBuddyAuthState> {
@@ -220,7 +207,7 @@ export async function interactiveLogin(opts: { openBrowser?: (url: string) => vo
 }
 
 /**
- * 获取有效 token：缓存 → 本地存储 →（旧版 App）→ 刷新 → 网页登录。
+ * 获取有效 token：缓存 → 本地存储 → 刷新 → 网页登录。
  */
 export async function getToken(): Promise<WorkBuddyAuthState> {
   if (cached && Date.now() < cached.expiresAt - settings.refreshAheadMs) return cached;
@@ -234,17 +221,7 @@ export async function getToken(): Promise<WorkBuddyAuthState> {
       if (Date.now() < fromStore.expiresAt - settings.refreshAheadMs) return fromStore;
     }
 
-    // 2) 旧版兼容（可选）：读取并解密 App 登录态
-    if (settings.useLegacyApp && legacyReader) {
-      const legacy = legacyReader();
-      if (legacy) {
-        writeStore(legacy);
-        cached = legacy;
-        if (Date.now() < legacy.expiresAt - settings.refreshAheadMs) return legacy;
-      }
-    }
-
-    // 3) 有 refresh token 就续期
+    // 2) 有 refresh token 就续期
     const base = cached ?? fromStore ?? loadFromEnv();
     if (base?.refreshToken) {
       try {
@@ -259,7 +236,7 @@ export async function getToken(): Promise<WorkBuddyAuthState> {
       }
     }
 
-    // 4) 网页登录（仅在允许自动登录时；否则抛错，引导用 pnpm login）
+    // 3) 网页登录（仅在允许自动登录时；否则抛错，引导用 pnpm login）
     if (!settings.autoLogin) {
       throw new Error(
         '无有效登录态。请先运行 `pnpm login` 完成网页登录，' +
@@ -320,13 +297,11 @@ export function getAuthStatus(): {
   hasRefreshToken?: boolean;
   credentialPath: string;
   storeKind: string;
-  legacyApp: boolean;
 } {
   const kind = store.describeKind(store.readBlob(settings.credentialPath));
   const base = {
     credentialPath: settings.credentialPath,
     storeKind: kind,
-    legacyApp: settings.useLegacyApp,
   };
   if (!cached) return { loggedIn: false, ...base };
   return {
@@ -343,7 +318,7 @@ export function getAuthStatus(): {
 
 /** 启动期无阻塞探测：填充缓存但不触发登录，返回状态 */
 export function initTokenManager(): void {
-  cached = readStore() ?? (settings.useLegacyApp && legacyReader ? legacyReader() : null);
+  cached = readStore();
 }
 
 /** 采纳外部凭据（诊断脚本用） */

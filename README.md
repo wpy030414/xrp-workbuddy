@@ -1,6 +1,6 @@
-# xrl-router-plugin-workbuddy
+# xrp-workbuddy
 
-> WorkBuddy / CodeBuddy 通道的 xrl-router 插件 — 自包含网页登录（OAuth 式 state 握手），把官方网关包装成 OpenAI Chat Completions 兼容服务。
+> WorkBuddy / CodeBuddy 通道的 xrl-router 插件 — **唯一登录方式为自包含网页登录**（OAuth 式 state 握手），把官方网关包装成 OpenAI Chat Completions 兼容服务。
 
 ```
 OpenAI / Anthropic 客户端 → xrl-router :19068 → 本插件 :19069 → copilot.tencent.com
@@ -13,8 +13,6 @@ OpenAI / Anthropic 客户端 → xrl-router :19068 → 本插件 :19069 → copi
 - 凭证本地静态加密存储（Windows 用 DPAPI，跨平台用 passphrase AES），不落明文、不进 git
 - 通过 WebSocket 向 xrl-router 注册（V24 契约，无 `keys`），由 Router 统一做鉴权、路由、密钥轮转
 - 模型目录在启动时从网关动态拉取，当前可注册 33 个文本模型
-
-> 可选兼容：`WORKBUDDY_USE_LEGACY_APP=1` 时，插件会额外读取并解密本机 WorkBuddy App 的登录态文件（见 docs 第 3 节）。默认关闭。
 
 ## 前置要求
 
@@ -71,7 +69,6 @@ curl -sN http://127.0.0.1:19069/v1/chat/completions \
 | `WORKBUDDY_STORE_MODE` | `auto` | 存储形态：`auto` / `dpapi` / `aes` / `plain` |
 | `WORKBUDDY_AUTH_SECRET` | 空 | AES 模式 passphrase；设置后 `auto` 优先用 AES（跨平台可迁移） |
 | `WORKBUDDY_AUTO_LOGIN` | `0` | 无登录态时服务是否自动弹浏览器登录；默认关闭，改用 `pnpm login` |
-| `WORKBUDDY_USE_LEGACY_APP` | `0` | 开启后才读取/解密 WorkBuddy App 登录态（旧版兼容） |
 | `WORKBUDDY_MODELS` | 空 | 逗号分隔的模型白名单；留空 = 拉取完整目录 |
 | `WORKBUDDY_REFRESH_AHEAD_MS` | `300000` | access token 提前刷新窗口 |
 | `WORKBUDDY_REQUEST_TIMEOUT_MS` | `600000` | 上游请求超时 |

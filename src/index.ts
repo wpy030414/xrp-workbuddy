@@ -10,14 +10,10 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { settings } from './config';
 import { forwardChatCompletions } from './client';
-import { getAuthStatus, initTokenManager, registerLegacyReader } from './auth';
-import { readLegacyAppAuth } from './legacy';
+import { getAuthStatus, initTokenManager } from './auth';
 import { PluginClient } from './pluginClient';
 
 const PLUGIN_ID = 'plugin-workbuddy';
-
-// 旧版兼容：仅当显式开启时，把 App 登录态读取接入凭证解析链
-if (settings.useLegacyApp) registerLegacyReader(readLegacyAppAuth);
 
 const app = new Hono();
 

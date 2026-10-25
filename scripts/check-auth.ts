@@ -15,7 +15,6 @@ async function main(): Promise<void> {
   console.log('登录网关      :', settings.authBaseUrl);
   console.log('推理网关      :', settings.baseUrl);
   console.log('凭证文件      :', settings.credentialPath);
-  console.log('旧版 App 兼容 :', settings.useLegacyApp ? '开启' : '关闭');
 
   const status = getAuthStatus();
   console.log('登录状态      :', JSON.stringify(status, null, 2));
