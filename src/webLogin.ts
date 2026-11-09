@@ -21,16 +21,19 @@ import { spawn } from 'node:child_process';
 import { settings } from './config';
 import { decodeJwtPayload } from './jwt';
 
-/** 尽力在系统默认浏览器打开 URL；失败不抛错（终端会打印链接供手动打开） */
+/**
+ * 尽力在系统默认浏览器打开 URL；失败不抛错（终端会打印链接供手动打开）。
+ *
+ * Windows 上不能给 cmd 传裸 URL：cmd 解析 `start` 后的参数时把 `&` 当作命令分隔符，
+ * authUrl 形如 `.../login?platform=workbuddy&state=<state>` 会被截断在 `&` 处，
+ * state 丢失后登录永远等不到回调。解决：交给 shell 拼命令行，并把 URL 用双引号包住再传给 cmd.exe。
+ */
 export function openExternal(url: string): void {
-  const cmd =
-    process.platform === 'win32'
-      ? { file: 'cmd', args: ['/c', 'start', '""', url] }
-      : process.platform === 'darwin'
-        ? { file: 'open', args: [url] }
-        : { file: 'xdg-open', args: [url] };
+  const isWin = process.platform === 'win32';
+  const file = isWin ? `start "" "${url}"` : process.platform === 'darwin' ? 'open' : 'xdg-open';
+  const args = isWin ? [] : [url];
   try {
-    const child = spawn(cmd.file, cmd.args, { stdio: 'ignore', detached: true });
+    const child = spawn(file, args, { stdio: 'ignore', detached: true, shell: isWin });
     child.on('error', () => {});
     child.unref();
   } catch {
