@@ -10,6 +10,7 @@
 
 import { settings } from './config';
 import { decodeJwtPayload, jwtExpiresAt } from './jwt';
+import { normalizeExpiry, toMs, isTokenUsable, type ExpiryCarrier } from './tokenExpiry';
 import * as store from './credentialStore';
 import { requestHandshake, waitForLogin, fetchAccount, openExternal, type IssuedTokens } from './webLogin';
 
@@ -20,7 +21,7 @@ export interface WorkBuddyAuthState {
   domain: string;
   expiresAt: number;
   refreshExpiresAt?: number;
-  source: 'env' | 'cache' | 'store' | 'web';
+  source: 'env' | 'store' | 'web';
 }
 
 export { decodeJwtPayload };
@@ -48,6 +49,11 @@ function toStored(s: WorkBuddyAuthState): StoredCredential {
   };
 }
 
+/** 缓存是否可复用（提前刷新量按 token 额定寿命自适应） */
+function isUsable<T extends ExpiryCarrier>(s: T | null | undefined): s is T {
+  return isTokenUsable(s, settings.refreshAheadMs);
+}
+
 function storeOpts() {
   return { file: settings.credentialPath, mode: settings.storeMode, secret: settings.authSecret || undefined };
 }
@@ -64,8 +70,8 @@ function readStore(): WorkBuddyAuthState | null {
       refreshToken: c.refreshToken || '',
       uid: c.uid || decodeJwtPayload(c.accessToken).sub || '',
       domain: c.domain || settings.domain,
-      expiresAt: Number(c.expiresAt) || jwtExpiresAt(c.accessToken),
-      refreshExpiresAt: c.refreshExpiresAt,
+      expiresAt: normalizeExpiry(c.expiresAt, c.accessToken),
+      refreshExpiresAt: toMs(c.refreshExpiresAt) || undefined,
       source: 'store',
     };
   } catch (e: any) {
@@ -165,10 +171,14 @@ function applyRefresh(base: WorkBuddyAuthState, p: RefreshPayload): WorkBuddyAut
     refreshToken: p.refreshToken ?? base.refreshToken,
     uid: base.uid || decodeJwtPayload(p.accessToken).sub || '',
     domain: p.domain || base.domain,
-    expiresAt: p.expiresAt ?? (p.expiresIn ? Date.now() + p.expiresIn * 1000 : jwtExpiresAt(p.accessToken)),
+    expiresAt: normalizeExpiry(
+      p.expiresAt ?? (p.expiresIn ? Date.now() + p.expiresIn * 1000 : undefined),
+      p.accessToken,
+    ),
     refreshExpiresAt:
-      p.refreshExpiresAt ?? (p.refreshExpiresIn ? Date.now() + p.refreshExpiresIn * 1000 : base.refreshExpiresAt),
-    source: base.source === 'cache' ? 'store' : base.source,
+      toMs(p.refreshExpiresAt ?? (p.refreshExpiresIn ? Date.now() + p.refreshExpiresIn * 1000 : undefined)) ||
+      base.refreshExpiresAt,
+    source: base.source === 'env' ? 'env' : 'store',
   };
 }
 
@@ -178,14 +188,17 @@ function tokensToState(t: IssuedTokens, uid: string, domain: string): WorkBuddyA
     refreshToken: t.refreshToken,
     uid: uid || decodeJwtPayload(t.accessToken).sub || '',
     domain: domain || t.domain || settings.domain,
-    expiresAt: t.expiresAt,
-    refreshExpiresAt: t.refreshExpiresAt,
+    expiresAt: normalizeExpiry(t.expiresAt, t.accessToken),
+    refreshExpiresAt: toMs(t.refreshExpiresAt) || undefined,
     source: 'web',
   };
 }
 
 let cached: WorkBuddyAuthState | null = null;
+/** 进行中的「续期」，与「网页登录」分开，避免登录期间把刷新请求一起挂住 */
 let refreshing: Promise<WorkBuddyAuthState> | null = null;
+/** 进行中的网页登录（并发请求共用同一次浏览器登录） */
+let loggingIn: Promise<WorkBuddyAuthState> | null = null;
 
 /** 交互式网页登录：握手 → 打开浏览器 → 轮询换票 → 取账号 → 落盘 */
 export async function interactiveLogin(opts: { openBrowser?: (url: string) => void; signal?: AbortSignal } = {}): Promise<WorkBuddyAuthState> {
@@ -206,22 +219,32 @@ export async function interactiveLogin(opts: { openBrowser?: (url: string) => vo
   return state;
 }
 
+/** 网页登录去重：并发请求共用同一次浏览器登录，但不参与「续期」的排队 */
+function ensureLogin(): Promise<WorkBuddyAuthState> {
+  if (!loggingIn) {
+    loggingIn = interactiveLogin().finally(() => {
+      loggingIn = null;
+    });
+  }
+  return loggingIn;
+}
+
 /**
  * 获取有效 token：缓存 → 本地存储 → 刷新 → 网页登录。
  */
 export async function getToken(): Promise<WorkBuddyAuthState> {
-  if (cached && Date.now() < cached.expiresAt - settings.refreshAheadMs) return cached;
+  if (isUsable(cached)) return cached;
   if (refreshing) return refreshing;
 
   refreshing = (async () => {
-    // 1) 本地存储
+    // 1) 本地存储：只有确实可用才采纳，避免用磁盘旧值覆盖内存里更新的凭证
     const fromStore = readStore();
-    if (fromStore) {
+    if (isUsable(fromStore)) {
       cached = fromStore;
-      if (Date.now() < fromStore.expiresAt - settings.refreshAheadMs) return fromStore;
+      return fromStore;
     }
 
-    // 2) 有 refresh token 就续期
+    // 2) 有 refresh token 就续期（内存优先：其 refresh token 一定是最新的）
     const base = cached ?? fromStore ?? loadFromEnv();
     if (base?.refreshToken) {
       try {
@@ -232,6 +255,13 @@ export async function getToken(): Promise<WorkBuddyAuthState> {
         console.log(`[workbuddy] token 已刷新（有效期至 ${new Date(next.expiresAt).toISOString()}）`);
         return next;
       } catch (e: any) {
+        // refresh token 会轮换：可能是别的进程已经换过票，旧票才失败 → 先回读磁盘
+        const recovered = readStore();
+        if (recovered && recovered.accessToken !== base.accessToken && isUsable(recovered)) {
+          cached = recovered;
+          console.warn('[workbuddy] 续期失败，但磁盘凭证已被其他进程更新，改用磁盘凭证');
+          return recovered;
+        }
         console.warn(`[workbuddy] 续期失败，转网页登录: ${e.message}`);
       }
     }
@@ -243,7 +273,7 @@ export async function getToken(): Promise<WorkBuddyAuthState> {
           '或在 .env 设置 WORKBUDDY_AUTO_LOGIN=1 允许服务自动发起登录。',
       );
     }
-    return interactiveLogin();
+    return ensureLogin();
   })().finally(() => {
     refreshing = null;
   });
@@ -254,11 +284,12 @@ export async function getToken(): Promise<WorkBuddyAuthState> {
 /** 强制刷新（上游 401 时重试一次）；刷新不成则落回网页登录（仅 autoLogin 开启时） */
 export async function forceRefresh(): Promise<WorkBuddyAuthState> {
   if (refreshing) return refreshing;
-  const base = readStore() ?? cached ?? loadFromEnv();
+  // 内存优先（其 refresh token 最新）；没有内存值时再看磁盘与灾备环境变量
+  const base = cached ?? readStore() ?? loadFromEnv();
   if (!base?.refreshToken) {
     cached = null;
     if (!settings.autoLogin) throw new Error('无 refresh token，无法刷新；请运行 `pnpm login` 重新登录');
-    return interactiveLogin();
+    return ensureLogin();
   }
   refreshing = (async () => {
     try {
@@ -269,13 +300,20 @@ export async function forceRefresh(): Promise<WorkBuddyAuthState> {
       console.log(`[workbuddy] token 已强制刷新（有效期至 ${new Date(next.expiresAt).toISOString()}）`);
       return next;
     } catch (e: any) {
+      // 同 getToken：refresh token 轮换后，失败可能只是因为别的进程先换过票
+      const recovered = readStore();
+      if (recovered && recovered.accessToken !== base.accessToken && isUsable(recovered)) {
+        cached = recovered;
+        console.warn('[workbuddy] 强制刷新失败，但磁盘凭证已被其他进程更新，改用磁盘凭证');
+        return recovered;
+      }
       cached = null;
       if (!settings.autoLogin) {
         console.warn(`[workbuddy] 强制刷新失败（登录态可能已失效）: ${e.message}`);
         throw new Error('refresh token 续期失败，请运行 `pnpm login` 重新登录');
       }
       console.warn(`[workbuddy] 强制刷新失败，转网页登录: ${e.message}`);
-      return interactiveLogin();
+      return ensureLogin();
     }
   })().finally(() => {
     refreshing = null;
@@ -289,6 +327,8 @@ export function getCachedAuth(): WorkBuddyAuthState | null {
 
 export function getAuthStatus(): {
   loggedIn: boolean;
+  /** token 尚未过期，但已进入提前刷新窗口（下一次请求会触发续期） */
+  expiringSoon: boolean;
   uid?: string;
   source?: string;
   domain?: string;
@@ -303,9 +343,10 @@ export function getAuthStatus(): {
     credentialPath: settings.credentialPath,
     storeKind: kind,
   };
-  if (!cached) return { loggedIn: false, ...base };
+  if (!cached) return { loggedIn: false, expiringSoon: false, ...base };
   return {
     loggedIn: Date.now() < cached.expiresAt,
+    expiringSoon: !isUsable(cached),
     uid: cached.uid,
     source: cached.source,
     domain: cached.domain,

@@ -15,6 +15,14 @@ function envBool(key: string, fallback: boolean): boolean {
   return /^(1|true|yes|on)$/i.test(v.trim());
 }
 
+/** 整数环境变量：非法值（NaN / 空 / 非数字）回退默认值，避免 NaN 污染后续时间比较 */
+function envInt(key: string, fallback: number): number {
+  const raw = process.env[key];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw.trim());
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
 /** 自包含凭证文件默认落在用户数据目录，不进仓库 */
 function detectCredentialPath(): string {
   const base =
@@ -73,7 +81,7 @@ export interface Settings {
 }
 
 export const settings: Settings = {
-  port: parseInt(env('WORKBUDDY_PORT', '19069'), 10),
+  port: envInt('WORKBUDDY_PORT', 19069),
 
   baseUrl: env('WORKBUDDY_BASE_URL', 'https://copilot.tencent.com').replace(/\/+$/, ''),
   authBaseUrl: env('WORKBUDDY_AUTH_BASE_URL', 'https://www.workbuddy.cn').replace(/\/+$/, ''),
@@ -88,17 +96,17 @@ export const settings: Settings = {
   authStatePath: env('WORKBUDDY_AUTH_STATE_PATH', '/v2/plugin/auth/state'),
   authTokenPath: env('WORKBUDDY_AUTH_TOKEN_PATH', '/v2/plugin/auth/token'),
   accountPath: env('WORKBUDDY_ACCOUNT_PATH', '/v2/plugin/account'),
-  loginPendingCode: parseInt(env('WORKBUDDY_LOGIN_PENDING_CODE', '11217'), 10),
-  loginTimeoutMs: parseInt(env('WORKBUDDY_LOGIN_TIMEOUT_MS', String(5 * 60_000)), 10),
-  loginPollMs: parseInt(env('WORKBUDDY_LOGIN_POLL_MS', '1000'), 10),
+  loginPendingCode: envInt('WORKBUDDY_LOGIN_PENDING_CODE', 11217),
+  loginTimeoutMs: envInt('WORKBUDDY_LOGIN_TIMEOUT_MS', 5 * 60_000),
+  loginPollMs: envInt('WORKBUDDY_LOGIN_POLL_MS', 1000),
   autoLogin: envBool('WORKBUDDY_AUTO_LOGIN', false),
 
   credentialPath: env('WORKBUDDY_CREDENTIAL_PATH', detectCredentialPath()),
   storeMode: (env('WORKBUDDY_STORE_MODE', 'auto') as Settings['storeMode']),
   authSecret: env('WORKBUDDY_AUTH_SECRET', ''),
 
-  refreshAheadMs: parseInt(env('WORKBUDDY_REFRESH_AHEAD_MS', String(5 * 60_000)), 10),
-  requestTimeoutMs: parseInt(env('WORKBUDDY_REQUEST_TIMEOUT_MS', '600000'), 10),
+  refreshAheadMs: Math.max(0, envInt('WORKBUDDY_REFRESH_AHEAD_MS', 5 * 60_000)),
+  requestTimeoutMs: envInt('WORKBUDDY_REQUEST_TIMEOUT_MS', 600_000),
 
   availableModels: (process.env.WORKBUDDY_MODELS || '')
     .split(',')
