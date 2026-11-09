@@ -293,6 +293,11 @@ export async function forwardChatCompletions(body: any, c: Context): Promise<Res
   // 上游强制流式；去掉只对上游无意义的字段
   const forwardBody: any = { ...body, model, stream: true };
   delete forwardBody.extra_body;
+  // 强制上游回传 usage：非流式聚合依赖它，Router 的缓存命中统计也依赖它。
+  // 客户端显式置 false 时尊重客户端选择。
+  if (forwardBody.stream_options?.include_usage !== false) {
+    forwardBody.stream_options = { ...(forwardBody.stream_options || {}), include_usage: true };
+  }
   const bodyStr = JSON.stringify(forwardBody);
 
   const ac = new AbortController();
