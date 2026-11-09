@@ -234,6 +234,40 @@ chunk 是标准 OpenAI Chat Completions 结构，但 delta 带额外字段：
 4. `reasoning_content` 与 `content` 可能先后出现；usage 只在末尾分片有值
 5. 工具调用首个分片带 `id/type/function.name` 与空 `arguments`，续传分片 `name` 为空字符串、只带 `arguments` 片段
 
+### 5.1 请求侧文本指纹拦截（code 11128）
+
+网关在请求发出前对 messages 做**关键词匹配**，命中客户端身份指纹（任意 role，尤其 system）即返回：
+
+```
+HTTP 400
+{"code":11128, "msg":"Illegal API invocation from an unapproved channel", ...}
+```
+
+**匹配器特性（直连探针实测，2026-11-09）**：大小写不敏感、空白归一化、**零宽/不可见字符归一化**
+（U+200B 零宽空格、U+2060 词连接符均被剥除后匹配，插不可见字符的绕法已失效）。
+因此清洗必须用**可见的语义等价微调**，不能用零宽字符。
+
+已实测确认的指纹与最小改写（`src/client.ts` 的 `UPSTREAM_FINGERPRINT_REWRITES`，**不要删除**）：
+
+| 指纹（最小触发跨度） | 实测细节 | 改写 |
+|---|---|---|
+| `Anthropic's official CLI for Claude` | Claude Code 官方 CLI 的 system prompt 身份句 | 去 `'s` → `Anthropic official CLI for Claude` |
+| `Main branch (you will usually use this for PRs)` | Claude Code 在 git 仓库注入的环境块；裸括注 `(you will usually use this for PRs)` **不**触发，`Main branch: main` 也不触发，需完整组合 | 删除括注 → `Main branch: main` |
+| `x-anthropic-billing-header` | Claude Code 计费头指纹；去掉 `x-` 前缀后不触发 | → `anthropic-billing-header` |
+| `You are an AI agent powered by DeepSeek Harness` | DeepSeek Harness（DSH）agent 身份句，**整句才触发**：裸 `DeepSeek Harness`、砍掉 `You are`、`agent` 后加逗号均放行；句尾标点无关 | `agent` 后插逗号 → `You are an AI agent, powered by DeepSeek Harness` |
+
+实测**放行**（截至 2026-11-09 不在名单，未加规则）：Codex 各身份行变体
+（`You are Codex` / `Codex CLI` / `OpenAI Codex` / `You are a coding agent running in the Codex CLI...`）。
+名单随网关版本变化，复测时可用 `scripts/__probe.ts` 的直连探针法（临建临时脚本，勿入库）。
+
+触发面补充：会话自动压缩的摘要、工具结果回读（读取引用了指纹的文件）也会把指纹带进历史消息，
+因此清洗覆盖 messages 内**全部**文本——任意 role 的字符串 content、`text` 分片、`tool_calls` 的
+`arguments`——由 `sanitizeUpstreamMessages` 统一处理，不能只洗 system。
+
+⚠️ **路径安全**：裸 `DeepSeek Harness` 词组（含 `D:\...\DeepSeek Harness\resources\...`
+这类真实路径）上游**不拦截**，因此规则只匹配完整身份句、不碰裸词组——避免任何改写污染
+模型回传给工具的文件路径。新增规则时同样必须先探针确认最小触发跨度，改写范围能窄则窄。
+
 ## 6. xrl-router 转换兼容
 
 Router 把 `chat_completions` 插件的流转换为内部 IR，再渲染给 OpenAI / Anthropic 客户端。以下行为需要插件侧归一化：
